@@ -407,7 +407,7 @@ class ChatAgentContainer(SequentialRoutedAgent):
     """将ChatAgent包装为群聊兼容的代理容器"""
     
     def __init__(
-        self, 
+        self,
         parent_topic_type: str,      # 父编排器的Topic
         output_topic_type: str,      # 输出Topic
         agent: ChatAgent,           # 被包装的智能体
@@ -765,44 +765,42 @@ sequenceDiagram
     participant FSC as FileSurfer Container
     participant FS as FileSurfer Agent
     
-    Note over User,FS: 阶段1: 任务初始化和广播
+    Note over User,FS: 阶段1: 任务初始化
     User->>Orch: 用户任务请求
     Orch->>Orch: 生成计划和初始上下文
     
-    Orch->>WSC: GroupChatStart(initial_messages)
-    Orch->>CC: GroupChatStart(initial_messages)
-    Orch->>FSC: GroupChatStart(initial_messages)
-    
-    WSC->>WSC: 缓冲初始消息
-    CC->>CC: 缓冲初始消息  
-    FSC->>FSC: 缓冲初始消息
-    
     Note over User,FS: 阶段2: 执行循环 - WebSurfer任务
-    Orch->>Orch: 评估进度，选择WebSurfer执行
+    Orch->>Orch: 选择WebSurfer执行，生成上下文相关指令
     Orch->>WSC: GroupChatRequestPublish()
     
-    WSC->>WS: on_messages_stream(complete_context)
-    Note over WS: 基于完整消息历史<br/>执行网页操作
+    WSC->>WS: on_messages_stream(orchestrator_instruction)
+    Note over WS: 基于Orchestrator指令<br/>执行网页操作
     WS-->>WSC: 流式响应 + 最终Response
     
     WSC->>Orch: GroupChatAgentResponse(websurfer_result)
+    Orch->>Orch: 更新message_history<br/>整合WebSurfer执行结果
     
-    Note over User,FS: 阶段3: 响应广播和上下文更新
-    Orch->>CC: GroupChatAgentResponse(websurfer_result)
-    Orch->>FSC: GroupChatAgentResponse(websurfer_result)
-    
-    CC->>CC: 缓冲WebSurfer响应
-    FSC->>FSC: 缓冲WebSurfer响应
-    
-    Note over User,FS: 阶段4: 执行循环 - CoderAgent任务
-    Orch->>Orch: 评估进度，选择CoderAgent执行
+    Note over User,FS: 阶段3: 执行循环 - CoderAgent任务
+    Orch->>Orch: 选择CoderAgent执行<br/>基于WebSurfer结果生成开发指令
     Orch->>CC: GroupChatRequestPublish()
     
-    CC->>CA: on_messages_stream(complete_context)
-    Note over CA: 基于完整上下文<br/>(包括WebSurfer结果)<br/>生成和执行代码
+    CC->>CA: on_messages_stream(orchestrator_instruction)
+    Note over CA: 基于Orchestrator智能指令<br/>(已包含WebSurfer发现的技术栈信息)<br/>生成和执行代码
     CA-->>CC: 流式响应 + 最终Response
     
     CC->>Orch: GroupChatAgentResponse(coder_result)
+    Orch->>Orch: 更新message_history<br/>整合CoderAgent执行结果
+    
+    Note over User,FS: 阶段4: 执行循环 - WebSurfer测试
+    Orch->>Orch: 选择WebSurfer进行测试<br/>基于CoderAgent结果生成测试指令
+    Orch->>WSC: GroupChatRequestPublish()
+    
+    WSC->>WS: on_messages_stream(test_instruction)
+    Note over WS: 基于测试指令<br/>(已包含CoderAgent提供的服务地址)<br/>执行API测试
+    WS-->>WSC: 流式响应 + 测试结果
+    
+    WSC->>Orch: GroupChatAgentResponse(test_result)
+    Orch->>Orch: 整合测试结果，评估任务完成状态
     
     Note over User,FS: 阶段5: 任务完成
     Orch->>User: TaskResult(final_output)
@@ -810,28 +808,16 @@ sequenceDiagram
 
 #### 核心消息类型和数据流
 
-**1. 任务初始化消息**
-```python
-# 群聊开始消息 (GroupChatStart)
-@dataclass
-class GroupChatStart:
-    messages: List[BaseChatMessage] | None  # 初始任务上下文
-    
-# Orchestrator发送示例
-await self.publish_message(
-    GroupChatStart(messages=initial_task_messages),
-    topic_id=DefaultTopicId(type=self._group_topic_type),  # 广播到所有Agent
-)
-```
+**中心化协作的核心消息流**
 
-**2. 执行请求消息**
+**1. 精准执行请求**
 ```python
 # 执行请求消息 (GroupChatRequestPublish) 
 @dataclass  
 class GroupChatRequestPublish:
     pass  # 空消息，仅作为执行触发器
 
-# Orchestrator精准路由示例
+# Orchestrator精准路由到特定Agent
 next_speaker_topic = self._participant_name_to_topic_type[selected_agent]
 await self.publish_message(
     GroupChatRequestPublish(),
@@ -839,18 +825,37 @@ await self.publish_message(
 )
 ```
 
-**3. 响应消息**
+**2. Agent响应回传**
 ```python
 # Agent响应消息 (GroupChatAgentResponse)
 @dataclass
 class GroupChatAgentResponse:
     agent_response: Response  # 包含ChatMessage的完整响应
 
-# Agent Container发布响应
-await self.publish_message(
+# Agent Container只向Orchestrator发布响应
+    await self.publish_message(
     GroupChatAgentResponse(agent_response=final_response),
-    topic_id=DefaultTopicId(type=self._parent_topic_type),  # 回传给Orchestrator
-)
+    topic_id=DefaultTopicId(type=self._parent_topic_type),  # 仅回传给Orchestrator
+    )
+```
+
+**3. 智能指令生成**
+```python
+# Orchestrator基于message_history生成上下文相关指令
+def generate_context_aware_instruction(self, agent_name: str, task_step: str) -> str:
+    # 从完整消息历史中提取相关信息
+    relevant_context = self._extract_context_for_agent(agent_name, self._state.message_history)
+    
+    # 生成包含必要上下文的智能指令
+    instruction = f"""
+    {task_step}
+    
+    基于之前的执行结果：
+    {relevant_context}
+    
+    请执行具体操作...
+    """
+    return instruction
 ```
 
 #### Orchestrator的智能决策流程
@@ -884,33 +889,35 @@ flowchart TD
     style N fill:#f3e5f5
 ```
 
-#### 消息缓冲和上下文共享机制
+#### 智能指令传递和上下文管理
 
-**1. Container层的消息缓冲**
+**1. Orchestrator的智能指令生成**
 ```python
-# ChatAgentContainer的缓冲机制展示
-class MessageBuffering:
+# Orchestrator基于完整历史生成上下文相关指令
+class OrchestratorInstructionGeneration:
     def __init__(self):
-        self._message_buffer: List[BaseChatMessage] = []
+        self._state.message_history: List[BaseChatMessage] = []
     
-    @event
-    async def handle_start(self, message: GroupChatStart):
-        """缓冲初始消息"""
-        for msg in message.messages:
-            self._message_buffer.append(msg)
-    
-    @event  
     async def handle_agent_response(self, message: GroupChatAgentResponse):
-        """缓冲其他Agent的响应，实现上下文共享"""
-        self._message_buffer.append(message.agent_response.chat_message)
+        """接收Agent响应，更新全局历史"""
+        self._state.message_history.append(message.agent_response.chat_message)
     
-    @event
-    async def handle_request(self, message: GroupChatRequestPublish):
-        """将完整缓冲传递给实际Agent"""
-        async for response in self._agent.on_messages_stream(self._message_buffer):
-            # 处理Agent响应...
-            pass
-        self._message_buffer.clear()  # 避免重复处理
+    def generate_instruction_for_agent(self, agent_name: str, task_step: str) -> str:
+        """基于全局历史为特定Agent生成包含上下文的指令"""
+        # 提取与该Agent相关的上下文信息
+        relevant_info = self._extract_relevant_context(agent_name)
+        
+        # 生成智能指令
+        instruction = f"{task_step}\n\n{relevant_info}"
+        return instruction
+    
+    async def request_agent_execution(self, agent_name: str):
+        """向特定Agent发送执行请求"""
+        topic_type = self._participant_name_to_topic_type[agent_name]
+        await self.publish_message(
+            GroupChatRequestPublish(),
+            topic_id=DefaultTopicId(type=topic_type)
+        )
 ```
 
 **2. 上下文转换和优化**
@@ -963,43 +970,16 @@ graph LR
     style C5 fill:#f3e5f5
 ```
 
-#### 专业化智能体扩展
+#### 中心化协作的核心优势
 
-基于AutoGen框架，Magentic-UI扩展了专门的智能体类型：
+**修正后的通信机制对比**
 
-```python
-# 智能体继承体系和通信接口
-class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
-    """网页浏览智能体：集成Playwright浏览器控制"""
-    
-    async def on_messages_stream(self, messages: Sequence[BaseChatMessage], cancellation_token) -> AsyncGenerator:
-        # 1. 从消息历史中提取网页操作上下文
-        navigation_context = self._extract_navigation_context(messages)
-        
-        # 2. 基于完整上下文执行网页操作
-        async for result in self._execute_web_operations(navigation_context):
-            yield result
-
-class CoderAgent(BaseChatAgent, Component[CoderConfig]):
-    """代码执行智能体：集成Docker执行环境"""
-    
-    async def on_messages_stream(self, messages: Sequence[BaseChatMessage], cancellation_token) -> AsyncGenerator:
-        # 1. 基于消息历史构建代码生成上下文
-        code_context = self._build_coding_context(messages)
-        
-        # 2. 在安全Docker环境中生成和执行代码
-        async for result in self._generate_and_execute_code(code_context):
-            yield result
-```
-
-**通信机制的核心优势**
-
-| 特性 | 传统Agent系统 | Magentic-UI通信机制 |
-|------|---------------|-------------------|
-| **上下文共享** | 局部上下文，信息孤岛 | 全局消息历史，完整上下文共享 |
+| 特性 | 传统Agent系统 | Magentic-UI中心化协作 |
+|------|---------------|---------------------|
+| **上下文传递** | 局部上下文，信息孤岛 | Orchestrator智能指令融合 |
 | **错误恢复** | 简单重试机制 | 智能错误分析 + 动态重规划 |  
 | **任务协调** | 预定义工作流 | 基于进度评估的动态调度 |
-| **状态管理** | 无状态或简单状态 | 完整状态持久化和恢复 |
+| **状态管理** | 无状态或简单状态 | Orchestrator维护完整状态 |
 | **扩展性** | 紧耦合架构 | 基于Topic的松耦合通信 |
 
 #### 3.2.2 专业化智能体扩展
@@ -1009,27 +989,27 @@ class CoderAgent(BaseChatAgent, Component[CoderConfig]):
 Magentic-UI在AutoGen框架基础上扩展了专门的智能体类型：
 
 ```python
-# 智能体继承体系和通信接口
+# 智能体继承体系和智能指令处理
 class WebSurfer(BaseChatAgent, Component[WebSurferConfig]):
     """网页浏览智能体：集成Playwright浏览器控制"""
     
     async def on_messages_stream(self, messages: Sequence[BaseChatMessage], cancellation_token) -> AsyncGenerator:
-        # 1. 从消息历史中提取网页操作上下文
-        navigation_context = self._extract_navigation_context(messages)
+        # 1. 接收来自Orchestrator的智能指令（已包含必要上下文）
+        orchestrator_instruction = messages[-1]  # WebSurfer只处理最后一条消息
         
-        # 2. 基于完整上下文执行网页操作
-        async for result in self._execute_web_operations(navigation_context):
+        # 2. 基于智能指令执行网页操作
+        async for result in self._execute_web_operations(orchestrator_instruction.content):
             yield result
 
 class CoderAgent(BaseChatAgent, Component[CoderConfig]):
     """代码执行智能体：集成Docker执行环境"""
     
     async def on_messages_stream(self, messages: Sequence[BaseChatMessage], cancellation_token) -> AsyncGenerator:
-        # 1. 基于消息历史构建代码生成上下文
-        code_context = self._build_coding_context(messages)
+        # 1. 接收来自Orchestrator的开发指令（已包含技术栈、配置等信息）
+        development_instruction = messages[-1]
         
-        # 2. 在安全Docker环境中生成和执行代码
-        async for result in self._generate_and_execute_code(code_context):
+        # 2. 在Docker环境中生成和执行代码
+        async for result in self._generate_and_execute_code(development_instruction.content):
             yield result
 ```
 
